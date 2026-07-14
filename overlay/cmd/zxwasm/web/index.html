@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>zx_go wasm</title>
+<style>
+  body { background:#222; color:#eee; font-family:monospace; text-align:center; }
+  canvas { image-rendering:pixelcrisp; image-rendering:pixelated; border:2px solid #555;
+           max-width:95vw; height:auto; margin-top:12px; }
+  #status { margin-top:8px; }
+</style>
+</head>
+<body>
+  <h3>zx_go emulator in wasm</h3>
+  <div id="status">loading wasm...</div>
+  <canvas id="screen"></canvas>
+<script src="wasm_exec.js"></script>
+<script>
+const status = document.getElementById('status');
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+let buf, imgData, w, h, fps = 0, frames = 0, lastT = 0;
+
+const NEXT_MODE = new URLSearchParams(location.search).get('next') === '1';
+
+// --- WebAudio bridge ------------------------------------------------------
+// The AudioContext must match the emulator's fixed 44.1kHz so nothing has to
+// resample (which would drift pitch). It can only start after a user gesture
+// (browser autoplay policy), so we lazily boot it on the first key/click.
+const AUDIO_RATE = 44100;
+let audioCtx = null, audioNode = null;
+let sndBytes = null, sndI16 = null, sndF32 = null;  // reused per-tick scratch
+
+async function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new AudioContext({ sampleRate: AUDIO_RATE });
+  await audioCtx.audioWorklet.addModule('audio-worklet.js');
+  audioNode = new AudioWorkletNode(audioCtx, 'zx-audio', { outputChannelCount: [1] });
+  audioNode.connect(audioCtx.destination);
+  // Scratch buffers sized to the Go side's audioAccumCap (882*8 samples).
+  sndBytes = new Uint8Array(882 * 8 * 2);
+  sndI16 = new Int16Array(sndBytes.buffer);
+  sndF32 = new Float32Array(882 * 8);
+}
+function startAudioOnGesture() {
+  initAudio().then(() => audioCtx.resume()).catch(e => console.warn('audio:', e));
+}
+addEventListener('keydown', startAudioOnGesture, { once: true });
+addEventListener('pointerdown', startAudioOnGesture, { once: true });
+// Pause audio while the tab is hidden (rAF throttling would starve the ring
+// and glitch anyway); resume on return.
+addEventListener('visibilitychange', () => {
+  if (!audioCtx) return;
+  document.hidden ? audioCtx.suspend() : audioCtx.resume();
+});
+
+// Drain queued emulator samples and hand them to the worklet as Float32 [-1,1].
+function pumpAudio() {
+  if (!audioNode || audioCtx.state !== 'running' || typeof zxAudio !== 'function') return;
+  const n = zxAudio(sndBytes);           // fills sndBytes, returns sample count
+  if (!n) return;
+  for (let i = 0; i < n; i++) sndF32[i] = sndI16[i] / 32768;
+  audioNode.port.postMessage(sndF32.slice(0, n));
+}
+
+// Fetch a binary asset with download progress in the status line.
+// Returns null on 404 so optional ROMs (Multiface) can be skipped.
+async function fetchBytes(path, label) {
+  const res = await fetch(path);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
+  const total = +res.headers.get('Content-Length') || 0;
+  const reader = res.body.getReader();
+  const chunks = []; let got = 0;
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    status.textContent = total
+      ? `fetching ${label} -- ${(got/1e6).toFixed(1)} / ${(total/1e6).toFixed(1)} MB`
+      : `fetching ${label} -- ${(got/1e6).toFixed(1)} MB`;
+  }
+  const out = new Uint8Array(got);
+  let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+async function bootNext() {
+  // Licensed NextZXOS ROMs are NOT bundled -- serve.sh stages the locally
+  // installed copies into web/assets/ (gitignored). The FPGA loader has a
+  // GPLv3 copy embedded in the wasm, so it's optional here.
+  const wanted = [
+    ['enNextZX.rom',      true],   // NextZXOS firmware (required)
+    ['enNxtmmc.rom',      true],   // divMMC/esxDOS overlay (required)
+    ['enNextMF.rom',      false],  // Multiface (optional)
+    ['tbblue_loader.rom', false],  // FPGA loader (embedded fallback)
+  ];
+  for (const [name, required] of wanted) {
+    const bytes = await fetchBytes('assets/' + name, name);
+    if (bytes) zxRegisterROM(name, bytes);
+    else if (required) throw new Error(`missing assets/${name} -- run serve.sh to stage ROMs`);
+  }
+  const sd = await fetchBytes('assets/tbblue.mmc', 'SD image');
+  if (!sd) throw new Error('missing assets/tbblue.mmc -- set ZX_WASM_SD_IMG and re-run serve.sh');
+  status.textContent = 'booting Spectrum Next...';
+  const err = zxBootNext(sd);
+  if (err) throw new Error('zxBootNext: ' + err);
+}
+
+async function main() {
+  const go = new Go();
+  const res = await WebAssembly.instantiateStreaming(fetch('zx.wasm'), go.importObject);
+  go.run(res.instance); // returns when Go exits; our main() blocks, so it runs in background
+  // poll until the Go side has installed the API
+  await new Promise(r => { const t = setInterval(() => { if (globalThis.zxReady) { clearInterval(t); r(); } }, 10); });
+
+  if (NEXT_MODE) await bootNext();
+
+  const dims = zxFrame();          // no-arg call: get w,h without a copy
+  w = dims.w; h = dims.h;
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = (w * 2) + 'px';
+  buf = new Uint8Array(w * h * 4);
+  imgData = new ImageData(new Uint8ClampedArray(buf.buffer), w, h);
+  status.textContent = `running -- framebuffer ${w}x${h}`;
+
+  // Map a browser KeyboardEvent to a Fyne key name the core understands.
+  function fyneName(e) {
+    if (e.key === 'Enter')     return 'Return';
+    if (e.key === ' ')         return 'Space';
+    if (e.key === 'Backspace') return 'BackSpace';
+    if (e.key === 'Escape')    return 'Escape';
+    if (/^Arrow/.test(e.key))  return e.key.slice(5); // ArrowUp -> Up etc.
+    if (/^[a-z]$/.test(e.key)) return e.key.toUpperCase(); // Fyne letters are uppercase
+    if (/^[A-Z0-9]$/.test(e.key)) return e.key;
+    return null;
+  }
+  function send(e, down) {
+    if (e.repeat) return;
+    const name = fyneName(e);
+    if (name) { e.preventDefault(); zxKeyName(name, down, e.shiftKey); return; }
+    // Punctuation etc. -> SYMBOL-SHIFT rune via TypeRune (fires on keydown only;
+    // the pulse auto-releases after a few frames via kbd.Tick()).
+    if (down && e.key.length === 1) { e.preventDefault(); zxType(e.key.charCodeAt(0)); }
+  }
+  addEventListener('keydown', e => send(e, true));
+  addEventListener('keyup',   e => send(e, false));
+
+  requestAnimationFrame(loop);
+}
+
+let lastTick = 0, frameAcc = 0;
+const FRAME_MS = 20;                       // 50Hz PAL -- the Next runs at exactly
+                                           // 50 fps, which also yields 44100/50 =
+                                           // 882 audio samples per frame.
+function loop(t) {
+  // Pace the guest to a fixed 50Hz using an accumulated wall-clock debt,
+  // INDEPENDENT of the display refresh. Running one guest frame per rAF tick
+  // would clock the machine at the monitor's rate (60/120/144Hz) -- too fast,
+  // and it overproduces audio (fpsx882) versus the fixed 44100 sink, which
+  // overflows the sample queue and shreds sustained tones into rumble. With
+  // the debt, a 120Hz display simply skips most ticks; a slow tab catches up.
+  if (lastTick) frameAcc += t - lastTick;
+  lastTick = t;
+  let owed = Math.floor(frameAcc / FRAME_MS);
+  if (owed <= 0) { requestAnimationFrame(loop); return; }  // no whole frame due yet
+  frameAcc -= owed * FRAME_MS;
+  if (owed > 4) { owed = 4; frameAcc = 0; }  // dropped time (tab was hidden): don't fast-forward
+  for (let i = 0; i < owed - 1; i++) zxFrame(); // catch-up frames, no pixel copy
+  const d = zxFrame(buf);
+  pumpAudio();                            // drain this tick's samples to the worklet
+  if (d.w !== w || d.h !== h) {          // machine swapped / video mode changed: realloc
+    w = d.w; h = d.h;
+    canvas.width = w; canvas.height = h;
+    canvas.style.width = (w * 2) + 'px';
+    buf = new Uint8Array(w * h * 4);
+    imgData = new ImageData(new Uint8ClampedArray(buf.buffer), w, h);
+    requestAnimationFrame(loop);
+    return;
+  }
+  imgData.data.set(buf);                 // buf -> ImageData backing store
+  ctx.putImageData(imgData, 0, 0);
+  frames++;
+  if (t - lastT >= 1000) { fps = frames; frames = 0; lastT = t;
+    status.textContent = `running -- ${w}x${h} @ ${fps} fps`; }
+  requestAnimationFrame(loop);
+}
+main().catch(e => { status.textContent = 'error: ' + e; console.error(e); });
+</script>
+</body>
+</html>

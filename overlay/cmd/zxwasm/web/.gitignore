@@ -1,0 +1,3 @@
+# build artifacts produced by serve.sh
+zx.wasm
+wasm_exec.js
